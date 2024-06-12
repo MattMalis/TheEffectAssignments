@@ -1,12 +1,13 @@
 ---
 title: "Chapter 14 Coding Homework"
-author: "Nick Huntington-Klein"
+author: "Matt Malis"
 date: "Updated `r Sys.Date()`"
 output: pdf_document
 ---
 
 ```{r setup, include=FALSE}
-knitr::opts_chunk$set(echo = TRUE, eval = FALSE)
+knitr::opts_chunk$set(echo = TRUE, eval = T)
+library(tidyverse); library(lmtest); library(modelsummary)
 # library(Statamarkdown)
 ```
 
@@ -15,6 +16,18 @@ Follow the below instructions and turn in both your code and results:
 1. Load the `nsw_mixtape` data that can be found in the **causaldata** package associated with the book, or download it fromLoad the `dengue.csv` file provided to you, or from [this site](https://vincentarelbundock.github.io/Rdatasets/csv/causaldata/nsw_mixtape.csv). Documentation on the variables is available through the package, or [here](https://vincentarelbundock.github.io/Rdatasets/doc/causaldata/nsw_mixtape.html).
 
 Then, drop the `data_id` variable from the data.
+
+```{r}
+d = read.csv(
+  url('https://vincentarelbundock.github.io/Rdatasets/csv/causaldata/nsw_mixtape.csv')
+  ) |> tibble()
+d = d |> dplyr::select(-data_id,-rownames)
+
+# data is sorted with all treated obs first, followed by all control
+#  changing this just to see if the matching functions require it
+set.seed(123)
+d = d |> slice_sample(n=nrow(d),replace=F)
+```
 
 *Language-specific instructions*: 
 
@@ -27,10 +40,25 @@ Then, drop the `data_id` variable from the data.
 
 First, create a variable called `weight` in your data equal to 1 for all observations (weights that are all 1 will have no effect, but this will give us a clue as to how we could incorporate matching weights easily).
 
+```{r}
+d = d |> mutate(
+  weight = 1
+) |> 
+  rename(y=re78)
+```
+
 Second, write code that uses a set of given weights to estimate the effect of `treat` on `re78`, using `weight` as weights, and prints out a summary of the regression results. The easiest way to do this is probably weighted regression; see The Effect Section 13.4.1, but without any controls or predictors other than `treat`. **Keep in mind the standard errors on the estimate won't be quite right, since they won't account for the uncertainty in creating the weights.**
+
+```{r}
+lm(y ~ treat, weights=weight, data=d) |> coeftest()
+```
 
 Third, write code that creates and prints out a weighted balance table for all variables across values of `treat`, using `weight` as weighted. See The Effect Section 14.6.3. Don't worry about getting a table with tests of significant differences for now; just the means. 
 
+```{r,message=F}
+library(vtable)
+sumtable(d , group='treat', group.weight = 'weight')  
+```
 *Language-specific instructions*:
 
 - One easy way to get the balance table in R is with `sumtable()` in **vtable** by setting the `group` and `group.weight` options (and possibly `group.test`).
@@ -44,6 +72,19 @@ Third, write code that creates and prints out a weighted balance table for all v
 
 Check the documentation of the function you use to be sure you're matching with replacement.
 
+```{r, message=F}
+library(Matching)
+X = d |> dplyr::select(-y,-treat) |> as.matrix()
+M = Match(Y=d$y, Tr = d$treat, X=X
+          ,Weight=2 # for Mahalanobis distance
+          ,M=3 # number of matches
+          ,BiasAdjust=F
+          ,exact=F
+          ,replace=T
+          )
+summary(M)  
+```
+
 **Language-specific notes:**
 
 - Due to a namespace conflict (the same name used for two different functions in different packages), loading the **Matching** package may make the `select()` function not work. So be sure to re-load the **tidyverse** again afterwards, or use `dplyr::select()` instead of `select()` to let R know which version of `select()` to use.
@@ -51,7 +92,120 @@ Check the documentation of the function you use to be sure you're matching with 
 
 4. Create a post-matching balance table showing balance for all the matching variables (you'll probably want to use the balance function designed to follow the matching function you used, from the same package). Write a sentence commenting on whether the balance looks good. You may have to read the documentation for the function you use to figure out what the results mean.
 
+```{r}
+matched_inds_weights = tibble(
+  ind_t = M$index.treated,
+  ind_c = M$index.control,
+  w = M$weights
+)
+
+# verifying that all treated inds from original data are included in M$index.treated
+all_trt_inds = which(d$treat==1)
+table(all_trt_inds %in% M$index.treated)
+
+# each treated ind has between 3 and 11 matches, 3 is by far most common
+matched_inds_weights |> group_by(ind_t) |> summarise(n=n())  |> 
+  dplyr::select(n) |> table()
+
+# weights sum to 1 for each treated ind
+matched_inds_weights |> group_by(ind_t) |> summarise(w_sum = sum(w))  |> 
+  dplyr::select(w_sum) |> table()
+
+# each control ind (included in M) has between 1 and 9 matches, 1 or 2 are most common
+matched_inds_weights |> group_by(ind_c) |> summarise(n=n()) |> 
+  dplyr::select(n) |> table()
+
+# weights do not sum to 1 for each control ind
+matched_inds_weights |> group_by(ind_c) |> summarise(w_sum = sum(w))  |> 
+  dplyr::select(w_sum) |> summary()
+
+# example: for ind_c==4, we can see it accounts for 
+#  1/4 of the matches for ind_t = 51,
+#  and 1/6 of the matches for ind_t = 189
+matched_inds_weights |> filter(ind_c==4)
+matched_inds_weights |> filter(ind_c==4) |> pull(w) |> sum()
+# these weights sum to 0.4167; so ind_c=4 will receive total weight 0.4167
+#  (accounting for all the treated obs for which it is in the matching set)
+
+# merge in the total weight for each ind_c
+d_matched = d |> dplyr::select(-weight) |>
+  mutate(id = row_number()) |>
+  left_join(
+    matched_inds_weights |> group_by(id=ind_c) |> summarise(weight = sum(w)),
+    by='id'
+  )
+
+# set weight=1 for all treated obs, and weight=0 for all control obs with NA weight
+d_matched = d_matched |> mutate(
+  weight = case_when(
+    treat==1 ~ 1,
+    treat==0 & is.na(weight) ~ 0,
+    T ~ weight
+  )
+)
+
+# exactly the ATT from M$est, hooray!
+lm(y~treat, weights = weight, data=d_matched) |> coef()
+
+# SE is too small, because it doesn't account for variability in the matching
+lm(y~treat, weights = weight, data=d_matched) |> summary() |> coef() %>% .[2,2]
+```
+
+
+```{r}
+# bootstrapping the whole process:
+match_boot_fun = function(){
+# create bootstrap sample
+  d_boot = d |> slice_sample(n=nrow(d),replace=T)
+  X_boot = d_boot |> dplyr::select(-y,-treat) |> as.matrix()
+  # run the matching on the bootstrap sample
+  M_boot = Match(Y=d_boot$y, Tr = d_boot$treat, X=X_boot
+                 ,Weight=2 # for Mahalanobis distance
+                 ,M=3 # number of matches
+                 ,BiasAdjust=F
+                 ,exact=F
+                 ,replace=T
+  )
+  # store the weights
+  mboot_inds_weights = tibble(
+    ind_t = M_boot$index.treated,
+    ind_c = M_boot$index.control,
+    w = M_boot$weights
+  )
+  
+  # merge in the total weight for each ind_c
+  d_boot_matched = d_boot |> dplyr::select(-weight) |>
+    mutate(id = row_number()) |>
+    left_join(
+      mboot_inds_weights |> group_by(id=ind_c) |> summarise(weight = sum(w)),
+      by = 'id'
+    )
+  
+  # set weight=1 for all treated obs, and weight=0 for all control obs with NA weight
+  d_boot_matched = d_boot_matched |> mutate(
+    weight = case_when(
+      treat==1 ~ 1,
+      treat==0 & is.na(weight) ~ 0,
+      T ~ weight
+    )
+  )
+  
+  # store and return the ATT estimate from the weighted regression
+  att_boot = lm(y~treat, weights = weight, data=d_boot_matched) |> coef() %>% .['treat']
+  att_boot |> unname()
+}
+
+# run 1000 bootstrap replications
+set.seed(123)
+match_boot_out = replicate(n=1000, match_boot_fun())
+
+# point estimate and 95% CI
+quantile(match_boot_out, c(.025, .5, .975))
+sd(match_boot_out) # compare to to the AI SE of 797.63
+```
+
 5. Switching over to propensity score matching, use the same matching variables as in Question 3 to estimate the propensity to be treated (with a logit regression), and then add the treatment propensity to the data set as a new variable called `propensity`. Trim the propensity score, setting to missing any values from 0 to .05 or from .95 to 1 (this is a different method than done in the chapter).
+
 
 Be careful to get the predicted *probability of treatment* and not the predicted *index function*. You can check this by making sure the values are all between 0 and 1.
 
@@ -68,6 +222,74 @@ Be careful to get the predicted *probability of treatment* and not the predicted
 6. Create a new variable in the data called `ipw` with the inverse probability weight, and then estimate the treatment effect using those weights in a linear regression (keeping in mind the standard errors won't be quite right).
 
 Note that the same tools you used to trim `propensity` conditional on its value can also be used to calculate `ipw` in one way for treated observations and in another way for untreated observations.
+
+```{r}
+# single run of the IPW estimation 
+#  (point estimate should be fine, SE will be wrong):
+X = d |> dplyr::select(-y,-treat) |> as.matrix()
+# fit the model predicting treatment assignment
+pscore_logit_mod = glm(d$treat ~ X , family=binomial(link='logit'))
+# store the estimated propensity scores
+pscore_pred = predict(pscore_logit_mod,type='response')
+d$pscore = pscore_pred
+# trim the pscores, drop any < 0.05 or > 0.95
+d = d |> mutate(
+  pscore_trimmed = case_when(
+    pscore < 0.05 | pscore > .95 ~ NA_real_,
+    T ~ pscore
+  )
+)
+# compare IPW with trimmed vs untrimmed pscores
+ipw_mod_untrimmed = lm(y~treat, weights=1/pscore, data=d)
+ipw_mod_trimmed = lm(y~treat, weights=1/pscore_trimmed, data=d)
+modelsummary(models = list(ipw_mod_untrimmed, ipw_mod_trimmed),
+             gof_map = c('nobs'))
+# in this case, there are no pscores outside of (0.05, 0.95), so trimming doesn't matter
+# might matter in the bootstrapping
+```
+
+```{r}
+# bootstrap function
+ipw_boot_fun = function(){
+  d_boot = d |> slice_sample(n=nrow(d),replace=T)
+  X_boot = d_boot |> dplyr::select(-y,-treat) |> as.matrix()
+  
+  # fit the model predicting treatment assignment
+  pscore_logit_mod_boot = glm(d_boot$treat ~ X_boot, family=binomial(link='logit'))
+  # store the predicted pscores
+  pscore_pred_boot = predict(pscore_logit_mod_boot,type='response')
+  d_boot$pscore = pscore_pred_boot
+  # trim the pscores, drop any < 0.05 or > 0.95
+  d_boot = d_boot |> mutate(
+    pscore_trimmed = case_when(
+      pscore < 0.05 | pscore > .95 ~ NA_real_,
+      T ~ pscore
+    )
+  )
+  num_trummed = sum(is.na(d_boot$pscore_trimmed))
+  
+  # run the regression with 1/pscore_trimmed as weights
+  ipw_mod_boot_untrimmed = lm(y~treat, weights=1/pscore, data=d_boot)
+  ipw_mod_boot_trimmed = lm(y~treat, weights=1/pscore_trimmed, data=d_boot)
+
+  # return both bhats (trimmed and untrimmed)
+  att_boot_trimmed = ipw_mod_boot_trimmed |> coef() %>% .['treat']
+  att_boot_untrimmed = ipw_mod_boot_untrimmed |> coef() %>% .['treat']
+  c(att_boot_trimmed,att_boot_untrimmed,num_trummed)
+}
+
+# run 1000 boostrap replications
+set.seed(123)
+ipw_boot_out = replicate(1000, ipw_boot_fun()) |> t()
+
+# point estimate and 95% CI for trimmed IPW
+quantile(ipw_boot_out[,1], c(.025,.5,.975))
+sd(ipw_boot_out[,1]) # bootstrap SE
+
+# point estimate and 95% CI for untrimmed IPW
+quantile(ipw_boot_out[,2], c(.025,.5,.975))
+sd(ipw_boot_out[,2]) # bootstrap SE
+```
 
 **Language-specific notes:**
 
